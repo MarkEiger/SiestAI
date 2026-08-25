@@ -32,6 +32,10 @@ def esc(s):  # keep SwiftBar's "|" parameter separator and newlines out of user-
     return str(s).replace("|", "¦").replace("\n", " ")
 
 
+def q(s):  # parameter VALUE: SwiftBar splits params on spaces, so anything with spaces must be double-quoted
+    return '"' + esc(s).replace('"', "'") + '"'
+
+
 def dur(secs):
     m = int(secs // 60)
     return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
@@ -52,10 +56,10 @@ if len(sys.argv) > 1:
 try:
     st = query({"cmd": "status"})
 except (OSError, ValueError):
-    print(f"{ICON_DOWN} {ZZZ} | tooltip=sleeplockd is not running — sleep behaves normally")
+    print(f"{ICON_DOWN} {ZZZ} | tooltip={q('sleeplockd is not running — sleep behaves normally')}")
     print("---")
     print("sleeplockd not reachable | color=red")
-    print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
+    print(f"Open log | bash=/usr/bin/open param1={q(LOG)} terminal=false")
     sys.exit(0)
 
 home = os.path.expanduser("~")
@@ -71,10 +75,10 @@ if blocked:
     detail = "; ".join(f"{t} {c} ({d})" for t, c, d, _, _, _, stt, _ in rows if stt != "waiting")
     tip = f"Sleep blocked by {n_active} running prompt{'s' if n_active != 1 else ''}: {detail}"
     if n_wait: tip += f" — {n_wait} more waiting on you"
-    print(f"{ICON_HELD} {n_active} {ZZZ} | tooltip={esc(tip)}")
+    print(f"{ICON_HELD} {n_active} {ZZZ} | tooltip={q(tip)}")
 else:
     tip = "Sleep allowed — no prompts running" + (f" ({n_wait} waiting on you)" if n_wait else "")
-    print(f"{ICON_FREE} {n_active} {ZZZ} | tooltip={esc(tip)}")
+    print(f"{ICON_FREE} {n_active} {ZZZ} | tooltip={q(tip)}")
 
 print("---")
 print(("Sleep blocked — " if blocked else "Sleep allowed — ") + f"{n_active} running prompt{'s' if n_active != 1 else ''}" + (f", {n_wait} waiting on you" if n_wait else "") + " | size=12")
@@ -83,10 +87,11 @@ if rows:
     for tool, cwd, d, pid, sid, alive, stt, reason in rows:
         mark = "⏸" if stt == "waiting" else "▶"
         label = f"{mark} {tool:<6} {cwd}  ·  {d}  ·  pid {pid}" + ("" if alive else "  (dead)")
-        print(f"{esc(label)} | font=Menlo size=12 tooltip={esc(('waiting on you' if stt == 'waiting' else reason) + ' — session ' + sid + ' — click: show its terminal · ⌥-click: release')} "
-              f"bash={sys.executable} param1={ME} param2=focus param3={esc(sid)} terminal=false")
+        tip = ('waiting on you' if stt == 'waiting' else reason) + ' — session ' + sid + ' — click: show its terminal · ⌥-click: release'
+        print(f"{esc(label)} | font=Menlo size=12 tooltip={q(tip)} "
+              f"bash={q(sys.executable)} param1={q(ME)} param2=focus param3={q(sid)} terminal=false")
         print(f"{esc('⏏ release ' + label[2:])} | alternate=true font=Menlo size=12 "
-              f"bash={sys.executable} param1={ME} param2=release param3={esc(sid)} terminal=false refresh=true")
+              f"bash={q(sys.executable)} param1={q(ME)} param2=release param3={q(sid)} terminal=false refresh=true")
 print("---")
-print(f"Release all (allow sleep now) | bash={sys.executable} param1={ME} param2=release-all terminal=false refresh=true")
-print(f"Open log | bash=/usr/bin/open param1={LOG} terminal=false")
+print(f"Release all (allow sleep now) | bash={q(sys.executable)} param1={q(ME)} param2=release-all terminal=false refresh=true")
+print(f"Open log | bash=/usr/bin/open param1={q(LOG)} terminal=false")
