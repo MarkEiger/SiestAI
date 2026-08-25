@@ -26,6 +26,7 @@ PMSET = os.environ.get("SLEEPLOCK_PMSET", "sudo -n /usr/bin/pmset").split()
 SWEEP_S = float(os.environ.get("SLEEPLOCK_SWEEP_S", "10"))
 TAIL_BYTES = 512 * 1024
 INTERRUPT_MARK = "[Request interrupted by user"
+CODEX_MARKS = ("task_started", "task_complete", "turn_aborted", "user_message")
 
 
 def log(msg):
@@ -54,16 +55,16 @@ def tool_for_path(path):
     return "codex" if "/.codex/" in path or "/rollout-" in path else "claude"
 
 
-def read_records(path, offset=0):
-    """JSON records appended after byte `offset` (tail-limited). Returns (records, size)."""
+def read_records(path, offset=0, window=TAIL_BYTES):
+    """JSON records appended after byte `offset`, limited to the last `window` bytes. Returns (records, start, size)."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
-            start = max(offset, size - TAIL_BYTES)
+            start = max(offset, size - window)
             f.seek(start)
             data = f.read()
     except OSError:
-        return [], 0
+        return [], 0, 0
     lines = data.split(b"\n")
     if start > offset and lines:
         lines = lines[1:]                     # dropped a partial first line
@@ -75,23 +76,38 @@ def read_records(path, offset=0):
             out.append(json.loads(l))
         except ValueError:
             pass
-    return out, size
+    return out, start, size
+
+
+def records_until_decisive(path, offset, decisive):
+    """Read backwards in growing windows until `decisive(records)` is true or we hit `offset`."""
+    window = TAIL_BYTES
+    while True:
+        recs, start, size = read_records(path, offset, window)
+        if decisive(recs) or start <= offset:
+            return recs
+        window *= 4
 
 
 def classify(path, offset=0, tool=None):
     """-> {"state": "active"|"idle"|"unknown", "reason": str, "detail": str}"""
-    recs, _ = read_records(path, offset)
     if tool not in ("claude", "codex"):
         tool = tool_for_path(path)
-        if tool == "claude" and any(r.get("type") in ("event_msg", "session_meta", "response_item") for r in recs):
+        probe, _, _ = read_records(path, offset, 65536)
+        if tool == "claude" and any(r.get("type") in ("event_msg", "session_meta", "response_item") for r in probe):
             tool = "codex"
+    if tool == "codex":
+        decisive = lambda rs: any(r.get("type") == "event_msg" and (r.get("payload") or {}).get("type") in CODEX_MARKS for r in rs)
+    else:
+        decisive = lambda rs: any(r.get("type") in ("user", "assistant") and not r.get("isSidechain") for r in rs)
+    recs = records_until_decisive(path, offset, decisive)
     if tool == "codex":
         last = None
         for r in recs:
             if r.get("type") != "event_msg":
                 continue
             t = (r.get("payload") or {}).get("type")
-            if t in ("task_started", "task_complete", "turn_aborted", "user_message"):
+            if t in CODEX_MARKS:
                 last = r
         if last is None:
             return {"state": "unknown", "reason": "no turn records yet", "detail": ""}
@@ -247,6 +263,12 @@ class Daemon:
             h = self.holders[sess]
             if not pid_alive(h["pid"]):
                 self.drop(sess, "agent dead (sweep)"); changed = True; continue
+            if not h.get("transcript"):
+                # registered without a transcript (older client / hook payload): find it and judge the
+                # whole file — its last record is the session's current state.
+                path = find_transcript(sess)
+                if path:
+                    h.update(transcript=path, offset=0); log(f"discovered transcript for {sess}: {path}")
             if self.check_transcript(sess):
                 changed = True
         if changed:
@@ -314,6 +336,10 @@ class Daemon:
                     "holders": {s: dict(h, alive=pid_alive(h["pid"])) for s, h in self.holders.items()}}
         if cmd == "inspect":
             sess = str(req["session"]); h = self.holders.get(sess)
+            if h is None:
+                m = [s for s in self.holders if s.startswith(sess)]
+                if len(m) == 1:
+                    sess = m[0]; h = self.holders[sess]
             path = (h or {}).get("transcript") or find_transcript(sess)
             if not path:
                 return {"ok": False, "error": "no transcript found for that session"}

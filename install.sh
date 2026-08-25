@@ -1,12 +1,13 @@
 #!/bin/bash
 # sleeplock installer — idempotent; re-run after editing anything in this repo.
-#   ./install.sh [--no-codex] [--no-gui] [--native-gui] [--dry-run]
+#   ./install.sh [--no-codex] [--no-gui] [--native-gui] [--user-only] [--dry-run]
+#   --user-only: update binaries, daemon, hooks and GUI without touching sudoers / the boot LaunchDaemon (no password)
 #   GUI: SwiftBar plugin if SwiftBar is installed (sits next to your other plugins), else a native menu-bar app.
 set -euo pipefail
 cd "$(dirname "$0")"
 PREFIX="$HOME/.local/bin"; AGENTS="$HOME/Library/LaunchAgents"; ME=$(id -un); UID_=$(id -u)
-PY=$(command -v python3); CODEX=1; GUI=1; NATIVE=0; DRY=0
-for a in "$@"; do case $a in --no-codex) CODEX=0;; --no-gui) GUI=0;; --native-gui) NATIVE=1;; --dry-run) DRY=1;; *) echo "unknown arg $a"; exit 2;; esac; done
+PY=$(command -v python3); CODEX=1; GUI=1; NATIVE=0; DRY=0; USERONLY=0
+for a in "$@"; do case $a in --no-codex) CODEX=0;; --no-gui) GUI=0;; --native-gui) NATIVE=1;; --user-only) USERONLY=1;; --dry-run) DRY=1;; *) echo "unknown arg $a"; exit 2;; esac; done
 run() { if [ $DRY = 1 ]; then echo "+ $*"; else "$@"; fi; }
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
@@ -32,6 +33,7 @@ case $MENU in
             run install -m 755 build/SleepLockMenu "$PREFIX/SleepLockMenu" ;;
 esac
 
+if [ $USERONLY = 0 ]; then
 say "sudoers (asks for your password): pmset disablesleep 0/1 only"
 tmp=$(mktemp); sed "s/__USER__/$ME/g" sudoers/sleeplock > "$tmp"
 run sudo visudo -cf "$tmp"
@@ -48,6 +50,9 @@ if ! run sudo -n /usr/bin/pmset -a disablesleep 0; then
   echo "FAIL: 'sudo -n pmset' still needs a password — check that /etc/sudoers has '#includedir /etc/sudoers.d' (sudo visudo -c)"; exit 1
 fi
 echo "ok: passwordless pmset works"
+else
+  say "user-only update: skipping sudoers and boot LaunchDaemon"
+fi
 
 say "user agents: daemon$([ $MENU = native ] && echo ' + native menu bar')"
 render() { sed -e "s|__HOME__|$HOME|g" -e "s|__PY__|$PY|g" "launchd/$1" > "$AGENTS/$1"; }
