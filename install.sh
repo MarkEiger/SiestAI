@@ -36,12 +36,18 @@ say "sudoers (asks for your password): pmset disablesleep 0/1 only"
 tmp=$(mktemp); sed "s/__USER__/$ME/g" sudoers/sleeplock > "$tmp"
 run sudo visudo -cf "$tmp"
 run sudo install -o root -g wheel -m 440 "$tmp" /etc/sudoers.d/sleeplock; rm -f "$tmp"
-run sudo -n /usr/bin/pmset -a disablesleep 0     # proves the rule works, and starts from a clean state
 
 say "boot-time reset (root LaunchDaemon): pmset disablesleep 0 on every boot"
 run sudo install -o root -g wheel -m 644 launchd/local.sleeplock.boot.plist /Library/LaunchDaemons/local.sleeplock.boot.plist
 run sudo launchctl bootout system/local.sleeplock.boot 2>/dev/null || true
 run sudo launchctl bootstrap system /Library/LaunchDaemons/local.sleeplock.boot.plist
+
+say "prove the sudoers rule works without a password (this is what the daemon relies on)"
+run sudo -k                                       # drop the cached password so the rule itself is tested
+if ! run sudo -n /usr/bin/pmset -a disablesleep 0; then
+  echo "FAIL: 'sudo -n pmset' still needs a password — check that /etc/sudoers has '#includedir /etc/sudoers.d' (sudo visudo -c)"; exit 1
+fi
+echo "ok: passwordless pmset works"
 
 say "user agents: daemon$([ $MENU = native ] && echo ' + native menu bar')"
 render() { sed -e "s|__HOME__|$HOME|g" -e "s|__PY__|$PY|g" "launchd/$1" > "$AGENTS/$1"; }
@@ -49,6 +55,7 @@ run install -d "$AGENTS"
 for label in local.sleeplockd $([ $MENU = native ] && echo local.sleeplock.menu); do
   if [ $DRY = 1 ]; then echo "+ render $label.plist"; else render "$label.plist"; fi
   run launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
+  sleep 0.5
   run launchctl bootstrap "gui/$UID_" "$AGENTS/$label.plist"
 done
 
@@ -62,5 +69,9 @@ if [ $CODEX = 1 ]; then
 fi
 
 say "verify"
-if [ $DRY = 0 ]; then sleep 1; "$PREFIX/sleeplock" status; pmset -g | grep SleepDisabled; fi
+if [ $DRY = 0 ]; then
+  for _ in 1 2 3 4 5 6; do [ -S "$HOME/.cache/sleeplock/sock" ] && break; sleep 0.5; done
+  "$PREFIX/sleeplock" status || echo "daemon not up yet — check: launchctl print gui/$UID_/local.sleeplockd; tail ~/.cache/sleeplock/sleeplockd.log"
+  pmset -g | grep SleepDisabled
+fi
 echo "done. logs: ~/.cache/sleeplock/sleeplockd.log"
