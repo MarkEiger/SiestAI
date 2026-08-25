@@ -1,6 +1,10 @@
 {
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
-  "Notification":     [{ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }]
+  "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
+  "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
+  "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
+  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "Stop":              [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "StopFailure":       [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "Notification":      [{ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }]
 }

@@ -65,6 +65,8 @@ if [ $CODEX = 1 ]; then
   say "hooks: Codex"
   run "$PY" bin/merge-hooks.py add "$HOME/.codex/hooks.json" hooks/codex.json
   run "$PY" bin/codex-enable-hooks.py "$HOME/.codex/config.toml"
+  echo "NOTE: Codex will NOT run these hooks until you approve them once: start codex, pick 'Trust all and continue'"
+  echo "      (or press t in /hooks). Non-interactive 'codex exec' needs that persisted trust or --dangerously-bypass-hook-trust."
   echo "NOTE: enabling Codex hooks also re-enables any plugin hooks (e.g. babysitter); manage those via /hooks in the Codex TUI."
 fi
 
