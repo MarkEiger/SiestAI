@@ -1,0 +1,5 @@
+{
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }]
+}

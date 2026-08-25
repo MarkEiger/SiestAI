@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""sleeplockd — keeps `pmset disablesleep 1` while any registered agent turn is running.
+
+IPC: Unix socket, one JSON object per line, one JSON reply per line.
+    {"cmd":"acquire","session":S,"pid":P,"tool":"claude","cwd":"..."}   turn started
+    {"cmd":"release","session":S}                                        turn finished
+    {"cmd":"release-all"} | {"cmd":"status"}
+PID monitoring: kqueue EVFILT_PROC/NOTE_EXIT — the kernel pushes an event when the agent
+exits; no polling, no PID-reuse hole. State is persisted (tagged with the boot time) so a
+daemon restart re-subscribes to still-alive agents, while state from a previous boot is
+discarded. On startup and shutdown sleep is re-enabled unless a live holder exists.
+"""
+import json, os, select, signal, socket, subprocess, sys, time
+
+BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
+SOCK = os.path.join(BASE, "sock")
+STATE = os.path.join(BASE, "state.json")
+PMSET = os.environ.get("SLEEPLOCK_PMSET", "sudo -n /usr/bin/pmset").split()
+
+
+def log(msg):
+    sys.stderr.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"); sys.stderr.flush()
+
+
+def boot_time():
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
+        return int(out.split("sec =")[1].split(",")[0])
+    except Exception:
+        return 0
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0); return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+class Daemon:
+    def __init__(self):
+        os.makedirs(BASE, exist_ok=True)
+        self.holders = {}        # session -> {"pid","since","tool","cwd"}
+        self.kq = select.kqueue()
+        self.subscribed = set()
+        self.sleep_disabled = None
+        self.boot = boot_time()
+        self.load()
+        self.apply(force=True)
+
+    # ---- persistence -------------------------------------------------------
+    def load(self):
+        try:
+            with open(STATE) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return
+        if saved.get("boot") != self.boot:
+            log("state is from a previous boot -> discarded"); return
+        for sess, h in saved.get("holders", {}).items():
+            if pid_alive(h["pid"]) and self.subscribe(h["pid"]):
+                self.holders[sess] = h
+                log(f"restored {sess} pid={h['pid']}")
+
+    def save(self):
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"boot": self.boot, "holders": self.holders}, f)
+        os.replace(tmp, STATE)
+
+    # ---- kqueue process subscription -------------------------------------
+    def subscribe(self, pid):
+        if pid in self.subscribed:
+            return True
+        ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
+        try:
+            self.kq.control([ev], 0, 0)
+        except (ProcessLookupError, OSError):
+            return False
+        self.subscribed.add(pid)
+        return True
+
+    def unsubscribe(self, pid):
+        if pid not in self.subscribed or any(h["pid"] == pid for h in self.holders.values()):
+            return
+        try:
+            self.kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_DELETE)], 0, 0)
+        except OSError:
+            pass
+        self.subscribed.discard(pid)
+
+    def on_exit(self, pid):
+        for s in [s for s, h in self.holders.items() if h["pid"] == pid]:
+            del self.holders[s]
+            log(f"agent pid={pid} exited -> released {s}")
+        self.subscribed.discard(pid)
+        self.changed()
+
+    # ---- pmset -----------------------------------------------------------
+    def apply(self, force=False):
+        want = 1 if self.holders else 0
+        if want == self.sleep_disabled and not force:
+            return
+        try:
+            subprocess.run(PMSET + ["-a", "disablesleep", str(want)], check=True, timeout=15,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            self.sleep_disabled = want
+            log(f"pmset disablesleep {want} ({len(self.holders)} holder(s))")
+        except Exception as e:
+            err = (getattr(e, "stderr", b"") or b"").decode(errors="replace").strip()
+            log(f"pmset failed: {e} {err}")
+
+    def changed(self):
+        self.save(); self.apply()
+
+    # ---- requests --------------------------------------------------------
+    def handle(self, req):
+        cmd = req.get("cmd")
+        if cmd == "acquire":
+            sess, pid = str(req["session"]), int(req["pid"])
+            if not self.subscribe(pid):
+                return {"ok": False, "error": "agent pid not alive"}
+            old = self.holders.get(sess)
+            same = old and old["pid"] == pid
+            self.holders[sess] = {"pid": pid, "since": old["since"] if same else time.time(),
+                                  "tool": str(req.get("tool") or (old["tool"] if same else "?")),
+                                  "cwd": str(req.get("cwd") or (old["cwd"] if same else ""))}
+            if old and old["pid"] != pid:
+                self.unsubscribe(old["pid"])
+            log(f"acquire {sess} pid={pid} tool={self.holders[sess]['tool']}")
+            self.changed(); return {"ok": True}
+        if cmd == "release":
+            h = self.holders.pop(str(req["session"]), None)
+            if h:
+                self.unsubscribe(h["pid"]); log(f"release {req['session']}"); self.changed()
+            return {"ok": True}
+        if cmd == "release-all":
+            old = list(self.holders.values()); self.holders.clear()
+            for h in old:
+                self.unsubscribe(h["pid"])
+            log("release-all"); self.changed(); return {"ok": True}
+        if cmd == "status":
+            return {"ok": True, "sleep_disabled": self.sleep_disabled, "now": time.time(),
+                    "holders": {s: dict(h, alive=pid_alive(h["pid"])) for s, h in self.holders.items()}}
+        return {"ok": False, "error": "unknown command"}
+
+    # ---- event loop ------------------------------------------------------
+    def serve(self):
+        if os.path.exists(SOCK):
+            os.unlink(SOCK)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK); os.chmod(SOCK, 0o600); srv.listen(16); srv.setblocking(False)
+        self.kq.control([select.kevent(srv.fileno(), filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0)
+        stop = {"flag": False}
+        def on_signal(*_): stop["flag"] = True
+        signal.signal(signal.SIGTERM, on_signal); signal.signal(signal.SIGINT, on_signal)
+        log(f"listening on {SOCK}")
+        while not stop["flag"]:
+            try:
+                events = self.kq.control(None, 64, 1.0)
+            except InterruptedError:
+                continue
+            for ev in events:
+                if ev.filter == select.KQ_FILTER_PROC and ev.fflags & select.KQ_NOTE_EXIT:
+                    self.on_exit(ev.ident)
+                elif ev.filter == select.KQ_FILTER_READ and ev.ident == srv.fileno():
+                    self.accept(srv)
+        # defer: never leave the machine unable to sleep. State stays on disk so a restarted
+        # daemon can re-subscribe to agents that are still alive.
+        self.save()
+        self.holders, saved = {}, self.holders
+        self.apply(force=True)
+        self.holders = saved
+        srv.close(); os.unlink(SOCK); log("stopped")
+
+    def accept(self, srv):
+        try:
+            conn, _ = srv.accept()
+        except BlockingIOError:
+            return
+        with conn:
+            conn.settimeout(2)
+            try:
+                data = b""
+                while b"\n" not in data and len(data) < 65536:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                try:
+                    reply = self.handle(json.loads(data.decode(errors="replace")))
+                except (ValueError, KeyError, TypeError) as e:
+                    reply = {"ok": False, "error": f"bad request: {e}"}
+                conn.sendall(json.dumps(reply).encode() + b"\n")
+            except OSError as e:
+                log(f"connection error: {e}")
+
+
+if __name__ == "__main__":
+    Daemon().serve()

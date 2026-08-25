@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""sleeplock — hook-side client for sleeplockd.
+    sleeplock acquire        (UserPromptSubmit)  hook JSON on stdin -> session_id, cwd
+    sleeplock release        (Stop / SessionEnd / idle notification)
+    sleeplock release-all
+    sleeplock status [--json]
+    sleeplock gui            status in a dialog (osascript) — the menu-bar app is the nicer option
+Hooks never block or fail: any error -> silent exit 0 (except status/gui)."""
+import json, os, socket, subprocess, sys, time
+
+BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
+SOCK = os.path.join(BASE, "sock")
+AGENTS = {"claude", "codex", "node", "bun"}
+
+
+def agent_process():
+    """(pid, tool) of the nearest ancestor that is the agent; hooks run via a shell."""
+    if os.environ.get("SLEEPLOCK_AGENT_PID"):
+        return int(os.environ["SLEEPLOCK_AGENT_PID"]), os.environ.get("SLEEPLOCK_TOOL", "test")
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            break
+        comm = os.path.basename(out[1].strip())
+        if comm in AGENTS:
+            return pid, comm
+        pid = int(out[0])
+    return os.getppid(), "?"
+
+
+def hook_input():
+    if sys.stdin.isatty():
+        return {}
+    try:
+        return json.load(sys.stdin)
+    except (ValueError, OSError):
+        return {}
+
+
+def send(req):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(2); s.connect(SOCK); s.sendall(json.dumps(req).encode() + b"\n")
+        return json.loads(s.makefile().readline())
+
+
+def fmt_status(d):
+    lines = [f"Sleep {'DISABLED' if d['sleep_disabled'] else 'enabled'} — {len(d['holders'])} running turn(s)"]
+    for s, h in sorted(d["holders"].items(), key=lambda kv: kv[1]["since"]):
+        mins = int((d["now"] - h["since"]) // 60)
+        lines.append(f"  {h['tool']:<7} pid={h['pid']:<6} {mins:>3}m  {h['cwd'] or '?'}  [{s[:8]}]{'' if h['alive'] else '  (dead)'}")
+    return "\n".join(lines)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "acquire":
+        h = hook_input(); pid, tool = agent_process()
+        sid = "".join(c if c.isalnum() or c in "_.-" else "_" for c in str(h.get("session_id", ""))) or f"pid-{pid}"
+        req = {"cmd": "acquire", "session": sid, "pid": pid, "tool": tool, "cwd": h.get("cwd") or os.getcwd()}
+    elif cmd == "release":
+        h = hook_input(); pid, _ = agent_process()
+        sid = "".join(c if c.isalnum() or c in "_.-" else "_" for c in str(h.get("session_id", ""))) or f"pid-{pid}"
+        req = {"cmd": "release", "session": sid}
+    elif cmd == "release-all":
+        req = {"cmd": "release-all"}
+    elif cmd in ("status", "gui"):
+        req = {"cmd": "status"}
+    else:
+        print(__doc__, file=sys.stderr); return 2
+    try:
+        reply = send(req)
+    except OSError as e:
+        if cmd in ("status", "gui"):
+            print(f"sleeplockd not reachable at {SOCK}: {e}", file=sys.stderr); return 1
+        return 0
+    if cmd == "status":
+        print(json.dumps(reply, indent=2) if "--json" in sys.argv else fmt_status(reply))
+    elif cmd == "gui":
+        text = fmt_status(reply).replace('"', "'")
+        subprocess.run(["osascript", "-e", f'display dialog "{text}" with title "sleeplock" buttons {{"OK"}} default button 1'])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

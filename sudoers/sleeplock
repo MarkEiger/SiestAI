@@ -1,0 +1,2 @@
+# sleeplock: let __USER__ toggle disablesleep without a password — nothing else.
+__USER__ ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0
