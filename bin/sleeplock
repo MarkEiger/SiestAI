@@ -61,9 +61,26 @@ def ancestry(pid):
         line = sh("ps", "-o", "ppid=,comm=", "-p", str(pid)).split(None, 1)
         if len(line) < 2:
             break
-        out.append(pid); comms[pid] = os.path.basename(line[1].strip())
+        exe = line[1].strip()
+        out.append(pid); comms[pid] = os.path.basename(exe)
+        if exe.startswith("/"):                    # kitten/wezterm live next to the terminal binary
+            add_path(os.path.dirname(exe))
         pid = int(line[0])
     return out, comms
+
+
+def add_path(*dirs):
+    """SwiftBar/launchd run us with a bare PATH (no /opt/homebrew/bin, no kitty.app) — widen it."""
+    cur = os.environ.get("PATH", "").split(":")
+    for d in dirs:
+        if d and d not in cur and os.path.isdir(d):
+            cur.append(d)
+    os.environ["PATH"] = ":".join(cur)
+
+
+add_path("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin"),
+         "/Applications/kitty.app/Contents/MacOS", os.path.expanduser("~/Applications/kitty.app/Contents/MacOS"),
+         "/Applications/WezTerm.app/Contents/MacOS", os.path.expanduser("~/Applications/WezTerm.app/Contents/MacOS"))
 
 
 def tmux_client_tty(tty):
@@ -96,6 +113,8 @@ def focus_kitty(pids, tty, kitty_pid=None):
             data = json.loads(sh("kitten", "@", "--to", f"unix:{sock}", "ls"))
         except (ValueError, subprocess.TimeoutExpired):
             continue
+        except FileNotFoundError:
+            return None
         for osw in data:
             for tab in osw.get("tabs", []):
                 for w in tab.get("windows", []):
