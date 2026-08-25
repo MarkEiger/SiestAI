@@ -1,5 +1,7 @@
-# sleeplock
+# SiestAI
 
+
+Let the machine take its siesta — but only when the AI is done. macOS today; Linux port is straightforward (see the bottom of this file).
 Keeps a Mac awake (lid closed included) **only while a Claude Code / Codex prompt is running**, across any number of concurrent sessions.
 
 ```
@@ -35,3 +37,6 @@ Install writes: `~/.local/bin/{sleeplock,sleeplockd}`, the SwiftBar plugin (or `
 A turn interrupted with Esc keeps its lock until that session's next `Stop`, exit, or (Claude Code only) the 60 s `idle_prompt` notification. Codex has no idle event; use the menu bar / `sleeplock release-all` if needed.
 
 Runtime files: `~/.cache/sleeplock/{sock,state.json,sleeplockd.log}`.
+
+## Linux?
+Not yet. The port is mostly deletions: `systemd-inhibit --what=sleep:handle-lid-switch` (an inhibitor lock that dies with its process) replaces `pmset` + sudoers + the boot LaunchDaemon; `pidfd_open` + `epoll` replaces `kqueue`; a systemd user unit replaces launchd; the SwiftBar plugin already speaks the xbar format that GNOME's Argos extension reads.
