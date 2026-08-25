@@ -4,10 +4,12 @@
     sleeplock waiting            blocked on the human         (PermissionRequest)
     sleeplock release            turn over                    (Stop, StopFailure, SessionEnd, idle_prompt)
     sleeplock inspect <session>  classify a session from its transcript (registered or not)
+    sleeplock focus <session>    bring the terminal window/tab running that session to the front
+                                 (kitty via remote control, Terminal.app/iTerm2 via AppleScript, tmux-aware)
     sleeplock status [--json] | release-all | gui
 Hook invocations read the hook JSON on stdin (session_id, cwd, transcript_path, hook_event_name).
 They never block or fail: any error -> silent exit 0 (except inspect/status/gui)."""
-import json, os, socket, subprocess, sys, time
+import glob, json, os, socket, subprocess, sys, time
 
 BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
 SOCK = os.path.join(BASE, "sock")
@@ -46,6 +48,138 @@ def send(req):
         return json.loads(s.makefile().readline())
 
 
+# ---------------------------------------------------------------- focus: pid -> terminal window
+def sh(*cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.get("timeout", 5)).stdout
+
+
+def ancestry(pid):
+    out, comms = [], {}
+    for _ in range(12):
+        if pid <= 1:
+            break
+        line = sh("ps", "-o", "ppid=,comm=", "-p", str(pid)).split(None, 1)
+        if len(line) < 2:
+            break
+        out.append(pid); comms[pid] = os.path.basename(line[1].strip())
+        pid = int(line[0])
+    return out, comms
+
+
+def tmux_client_tty(tty):
+    """If `tty` is a tmux pane, select it and return the tty of the terminal showing that tmux client."""
+    panes = sh("tmux", "list-panes", "-a", "-F", "#{pane_tty} #{session_name} #{window_id} #{pane_id}")
+    for line in panes.splitlines():
+        p_tty, sess, win, pane = line.split()
+        if p_tty == tty:
+            subprocess.run(["tmux", "select-window", "-t", win]); subprocess.run(["tmux", "select-pane", "-t", pane])
+            for c in sh("tmux", "list-clients", "-F", "#{client_tty} #{session_name}").splitlines():
+                c_tty, c_sess = c.split()
+                if c_sess == sess:
+                    return c_tty
+            clients = sh("tmux", "list-clients", "-F", "#{client_tty}").split()
+            if clients:
+                subprocess.run(["tmux", "switch-client", "-c", clients[0], "-t", sess]); return clients[0]
+    return None
+
+
+def activate_pid(pid, app_name):
+    """Bring the app owning `pid` to the front (works for a specific instance); fall back to open -a."""
+    r = sh("osascript", "-e", f'tell application "System Events" to set frontmost of (first process whose unix id is {pid}) to true')
+    if "error" in r.lower():
+        subprocess.run(["open", "-a", app_name])
+
+
+def focus_kitty(pids, tty, kitty_pid=None):
+    for sock in sorted(glob.glob("/tmp/kitty-*") + glob.glob("/tmp/kitty"), key=os.path.getmtime, reverse=True):
+        try:
+            data = json.loads(sh("kitten", "@", "--to", f"unix:{sock}", "ls"))
+        except (ValueError, subprocess.TimeoutExpired):
+            continue
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                for w in tab.get("windows", []):
+                    wpids = {w.get("pid")} | {fp.get("pid") for fp in w.get("foreground_processes", [])}
+                    if wpids & pids or (tty and w.get("tty") == tty):
+                        subprocess.run(["kitten", "@", "--to", f"unix:{sock}", "focus-window", "--match", f"id:{w['id']}"])
+                        activate_pid(kitty_pid, "kitty") if kitty_pid else subprocess.run(["open", "-a", "kitty"])
+                        return f"kitty window {w['id']} (tab {tab.get('title','')!r})"
+    return None
+
+
+def focus_terminal_app(tty):
+    script = f'''
+    tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "{tty}" then
+            set selected tab of w to t
+            set index of w to 1
+            activate
+            return "ok"
+          end if
+        end repeat
+      end repeat
+    end tell
+    return "no"'''
+    return "Terminal.app tab" if sh("osascript", "-e", script).strip() == "ok" else None
+
+
+def focus_iterm(tty):
+    script = f'''
+    tell application "iTerm2"
+      repeat with w in windows
+        repeat with t in tabs of w
+          repeat with s in sessions of t
+            if tty of s is "{tty}" then
+              select t
+              tell w to select
+              activate
+              return "ok"
+            end if
+          end repeat
+        end repeat
+      end repeat
+    end tell
+    return "no"'''
+    return "iTerm2 session" if sh("osascript", "-e", script).strip() == "ok" else None
+
+
+def focus(pid):
+    pids, comms = ancestry(pid)
+    tty = sh("ps", "-o", "tty=", "-p", str(pid)).strip()
+    tty = f"/dev/{tty}" if tty and tty != "??" else None
+    if tty and "tmux" in " ".join(comms.values()):
+        client = tmux_client_tty(tty)
+        if client:
+            tty = client
+            # the client's own process chain is what the terminal app knows about
+            for line in sh("ps", "-axo", "pid=,tty=,comm=").splitlines():
+                parts = line.split(None, 2)
+                if len(parts) == 3 and f"/dev/{parts[1]}" == client and parts[2].endswith("tmux"):
+                    more, _ = ancestry(int(parts[0])); pids = set(pids) | set(more)
+    pids = set(pids)
+    apps = {c.lower() for c in comms.values()}
+    kitty_pid = next((p for p, c in comms.items() if c.lower() == "kitty"), None)
+    order = []
+    if "kitty" in apps: order.append(lambda: focus_kitty(pids, tty, kitty_pid))
+    if "terminal" in apps: order.append(lambda: focus_terminal_app(tty))
+    if "iterm2" in apps: order.append(lambda: focus_iterm(tty))
+    order += [lambda: focus_kitty(pids, tty, kitty_pid), lambda: focus_terminal_app(tty), lambda: focus_iterm(tty)]
+    for fn in order:
+        try:
+            r = fn()
+        except Exception:
+            r = None
+        if r:
+            return r
+    for c in comms.values():                       # last resort: just raise the terminal app
+        if c.lower() in ("kitty", "terminal", "iterm2", "wezterm", "alacritty", "ghostty", "warp"):
+            subprocess.run(["open", "-a", {"terminal": "Terminal", "iterm2": "iTerm"}.get(c.lower(), c)])
+            return f"raised {c} (couldn't locate the exact tab; kitty needs allow_remote_control + listen_on)"
+    return None
+
+
 def dur(secs):
     m = int(secs // 60)
     return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
@@ -70,6 +204,8 @@ def main():
             req.update(pid=pid, tool=tool, cwd=h.get("cwd") or os.getcwd(), transcript=h.get("transcript_path") or "")
     elif cmd == "inspect" and len(sys.argv) > 2:
         req = {"cmd": "inspect", "session": sys.argv[2]}
+    elif cmd == "focus" and len(sys.argv) > 2:
+        req = {"cmd": "status"}
     elif cmd == "release-all":
         req = {"cmd": "release-all"}
     elif cmd in ("status", "gui"):
@@ -79,9 +215,18 @@ def main():
     try:
         reply = send(req)
     except OSError as e:
-        if cmd in ("status", "gui", "inspect"):
+        if cmd in ("status", "gui", "inspect", "focus"):
             print(f"sleeplockd not reachable at {SOCK}: {e}", file=sys.stderr); return 1
         return 0
+    if cmd == "focus":
+        want = sys.argv[2]
+        match = [(sid, h) for sid, h in reply["holders"].items() if sid.startswith(want)]
+        if len(match) != 1:
+            print(f"{'no' if not match else 'ambiguous'} registered session matching {want!r}", file=sys.stderr); return 1
+        sid, h = match[0]
+        r = focus(int(h["pid"]))
+        print(f"{sid[:8]} ({h['tool']} pid {h['pid']}): {r or 'could not locate its terminal window'}")
+        return 0 if r else 1
     if cmd == "status":
         print(json.dumps(reply, indent=2) if "--json" in sys.argv else fmt_status(reply))
     elif cmd == "inspect":

@@ -83,7 +83,7 @@ final class App: NSObject, NSApplicationDelegate {
                                   action: #selector(releaseOne(_:)), keyEquivalent: "")
             line.representedObject = sid
             line.target = self
-            line.toolTip = "session \(sid) — click to release this one"
+            line.toolTip = "session \(sid) — click: show its terminal · ⌥-click: release"
             menu.addItem(line)
         }
         addFooter()
@@ -98,8 +98,10 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     @objc func releaseOne(_ sender: NSMenuItem) {
-        if let sid = sender.representedObject as? String { _ = query(["cmd": "release", "session": sid]) }
-        refresh()
+        guard let sid = sender.representedObject as? String else { return }
+        if NSEvent.modifierFlags.contains(.option) { _ = query(["cmd": "release", "session": sid]); refresh(); return }
+        let p = Process(); p.executableURL = URL(fileURLWithPath: NSString("~/.local/bin/sleeplock").expandingTildeInPath); p.arguments = ["focus", sid]
+        try? p.run()
     }
     @objc func releaseAll() { _ = query(["cmd": "release-all"]); refresh() }
 }

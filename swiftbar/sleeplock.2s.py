@@ -9,13 +9,15 @@
 # Menu bar:  ☕ 2 💤   sleep blocked by 2 running prompts   (hover for who/where/how long)
 #            ☾ 0 💤   sleep allowed
 #            ⚠︎ 💤     daemon not running
-# Also invoked by its own menu items:  sleeplock.2s.py release <session> | release-all
-import json, os, socket, sys, time
+# Also invoked by its own menu items:  sleeplock.2s.py focus <session> | release <session> | release-all
+# Row click brings that session's terminal window to the front; hold ⌥ to see/click the release variant.
+import json, os, socket, subprocess, sys, time
 
 BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
 SOCK = os.path.join(BASE, "sock")
 LOG = os.path.join(BASE, "sleeplockd.log")
 ME = os.path.abspath(__file__)
+SLEEPLOCK_CLI = os.path.expanduser("~/.local/bin/sleeplock")
 ICON_HELD, ICON_FREE, ICON_DOWN = "☕", "☾", "⚠︎"      # tweak the look here
 ZZZ = "💤"
 
@@ -42,6 +44,8 @@ if len(sys.argv) > 1:
         query({"cmd": "release", "session": sys.argv[2]})
     elif cmd == "release-all":
         query({"cmd": "release-all"})
+    elif cmd == "focus" and len(sys.argv) > 2:
+        subprocess.run([sys.executable, SLEEPLOCK_CLI, "focus", sys.argv[2]])
     sys.exit(0)
 
 # ---- render ----------------------------------------------------------------------------
@@ -79,7 +83,9 @@ if rows:
     for tool, cwd, d, pid, sid, alive, stt, reason in rows:
         mark = "⏸" if stt == "waiting" else "▶"
         label = f"{mark} {tool:<6} {cwd}  ·  {d}  ·  pid {pid}" + ("" if alive else "  (dead)")
-        print(f"{esc(label)} | font=Menlo size=12 tooltip={esc(('waiting on you' if stt == 'waiting' else reason) + ' — session ' + sid + ' — click to release')} "
+        print(f"{esc(label)} | font=Menlo size=12 tooltip={esc(('waiting on you' if stt == 'waiting' else reason) + ' — session ' + sid + ' — click: show its terminal · ⌥-click: release')} "
+              f"bash={sys.executable} param1={ME} param2=focus param3={esc(sid)} terminal=false")
+        print(f"{esc('⏏ release ' + label[2:])} | alternate=true font=Menlo size=12 "
               f"bash={sys.executable} param1={ME} param2=release param3={esc(sid)} terminal=false refresh=true")
 print("---")
 print(f"Release all (allow sleep now) | bash={sys.executable} param1={ME} param2=release-all terminal=false refresh=true")
