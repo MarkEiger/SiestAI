@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""sleeplock — hook-side client for sleeplockd.
-    sleeplock acquire        (UserPromptSubmit)  hook JSON on stdin -> session_id, cwd
-    sleeplock release        (Stop / SessionEnd / idle notification)
-    sleeplock release-all
-    sleeplock status [--json]
-    sleeplock gui            status in a dialog (osascript) — the menu-bar app is the nicer option
-Hooks never block or fail: any error -> silent exit 0 (except status/gui)."""
+"""sleeplock — hook-side client / CLI for sleeplockd.
+    sleeplock acquire            turn started or heartbeat   (UserPromptSubmit, PreToolUse, PostToolUse, PermissionDenied)
+    sleeplock waiting            blocked on the human         (PermissionRequest)
+    sleeplock release            turn over                    (Stop, StopFailure, SessionEnd, idle_prompt)
+    sleeplock inspect <session>  classify a session from its transcript (registered or not)
+    sleeplock status [--json] | release-all | gui
+Hook invocations read the hook JSON on stdin (session_id, cwd, transcript_path, hook_event_name).
+They never block or fail: any error -> silent exit 0 (except inspect/status/gui)."""
 import json, os, socket, subprocess, sys, time
 
 BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
@@ -14,7 +15,6 @@ AGENTS = {"claude", "codex", "node", "bun"}
 
 
 def agent_process():
-    """(pid, tool) of the nearest ancestor that is the agent; hooks run via a shell."""
     if os.environ.get("SLEEPLOCK_AGENT_PID"):
         return int(os.environ["SLEEPLOCK_AGENT_PID"]), os.environ.get("SLEEPLOCK_TOOL", "test")
     pid = os.getppid()
@@ -46,24 +46,30 @@ def send(req):
         return json.loads(s.makefile().readline())
 
 
+def dur(secs):
+    m = int(secs // 60)
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
 def fmt_status(d):
-    lines = [f"Sleep {'DISABLED' if d['sleep_disabled'] else 'enabled'} — {len(d['holders'])} running turn(s)"]
-    for s, h in sorted(d["holders"].items(), key=lambda kv: kv[1]["since"]):
-        mins = int((d["now"] - h["since"]) // 60)
-        lines.append(f"  {h['tool']:<7} pid={h['pid']:<6} {mins:>3}m  {h['cwd'] or '?'}  [{s[:8]}]{'' if h['alive'] else '  (dead)'}")
+    hs = d["holders"]; active = [h for h in hs.values() if not h.get("waiting")]
+    lines = [f"Sleep {'DISABLED' if d['sleep_disabled'] else 'enabled'} — {len(active)} active turn(s), {len(hs) - len(active)} waiting on you"]
+    for s, h in sorted(hs.items(), key=lambda kv: kv[1]["since"]):
+        st = "WAITING" if h.get("waiting") else h.get("state", "?").upper()
+        lines.append(f"  {st:<8} {h['tool']:<7} pid={h['pid']:<6} {dur(d['now'] - h['since']):>6}  {h['cwd'] or '?'}  [{s[:8]}] {h.get('reason','')}{'' if h.get('alive', True) else '  (dead)'}")
     return "\n".join(lines)
 
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "acquire":
+    if cmd in ("acquire", "waiting", "release"):
         h = hook_input(); pid, tool = agent_process()
         sid = "".join(c if c.isalnum() or c in "_.-" else "_" for c in str(h.get("session_id", ""))) or f"pid-{pid}"
-        req = {"cmd": "acquire", "session": sid, "pid": pid, "tool": tool, "cwd": h.get("cwd") or os.getcwd()}
-    elif cmd == "release":
-        h = hook_input(); pid, _ = agent_process()
-        sid = "".join(c if c.isalnum() or c in "_.-" else "_" for c in str(h.get("session_id", ""))) or f"pid-{pid}"
-        req = {"cmd": "release", "session": sid}
+        req = {"cmd": cmd, "session": sid, "event": h.get("hook_event_name", "")}
+        if cmd != "release":
+            req.update(pid=pid, tool=tool, cwd=h.get("cwd") or os.getcwd(), transcript=h.get("transcript_path") or "")
+    elif cmd == "inspect" and len(sys.argv) > 2:
+        req = {"cmd": "inspect", "session": sys.argv[2]}
     elif cmd == "release-all":
         req = {"cmd": "release-all"}
     elif cmd in ("status", "gui"):
@@ -73,11 +79,25 @@ def main():
     try:
         reply = send(req)
     except OSError as e:
-        if cmd in ("status", "gui"):
+        if cmd in ("status", "gui", "inspect"):
             print(f"sleeplockd not reachable at {SOCK}: {e}", file=sys.stderr); return 1
         return 0
     if cmd == "status":
         print(json.dumps(reply, indent=2) if "--json" in sys.argv else fmt_status(reply))
+    elif cmd == "inspect":
+        if not reply.get("ok"):
+            print(reply.get("error")); return 1
+        if "--json" in sys.argv:
+            print(json.dumps(reply, indent=2)); return 0
+        c = reply["classification"]; h = reply.get("holder")
+        print(f"session    {reply['session']}\ntranscript {reply['transcript']}")
+        print(f"transcript says: {c['state'].upper()} — {c['reason']} {c['detail']}".rstrip())
+        if h:
+            tc = reply["turn_classification"]
+            print(f"registered: yes — {h['tool']} pid {h['pid']} ({'alive' if h['alive'] else 'DEAD'}), {h['cwd']}, held {dur(time.time() - h['since'])}")
+            print(f"daemon view: {'WAITING on you' if h.get('waiting') else 'ACTIVE'}; this turn's records say {tc['state']} — {tc['reason']} {tc['detail']}".rstrip())
+        else:
+            print("registered: no (not currently holding sleep)")
     elif cmd == "gui":
         text = fmt_status(reply).replace('"', "'")
         subprocess.run(["osascript", "-e", f'display dialog "{text}" with title "sleeplock" buttons {{"OK"}} default button 1'])

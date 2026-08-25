@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""sleeplockd — keeps `pmset disablesleep 1` while any registered agent turn is running.
+"""sleeplockd — keeps `pmset disablesleep 1` while any registered agent turn is actually running.
 
-IPC: Unix socket, one JSON object per line, one JSON reply per line.
-    {"cmd":"acquire","session":S,"pid":P,"tool":"claude","cwd":"..."}   turn started
-    {"cmd":"release","session":S}                                        turn finished
+IPC (unix socket, one JSON object per line, one JSON reply per line):
+    {"cmd":"acquire","session":S,"pid":P,"tool":"claude|codex","cwd":..,"transcript":..}   turn started / heartbeat
+    {"cmd":"waiting","session":S,...}      turn is blocked on the human (permission / question dialog)
+    {"cmd":"release","session":S}          turn finished
+    {"cmd":"inspect","session":S}          classify a session from its transcript (registered or not)
     {"cmd":"release-all"} | {"cmd":"status"}
-PID monitoring: kqueue EVFILT_PROC/NOTE_EXIT — the kernel pushes an event when the agent
-exits; no polling, no PID-reuse hole. State is persisted (tagged with the boot time) so a
-daemon restart re-subscribes to still-alive agents, while state from a previous boot is
-discarded. On startup and shutdown sleep is re-enabled unless a live holder exists.
+
+Signals used, per session:
+  * hooks           acquire / waiting / release (see hooks/*.json)
+  * kernel          kqueue NOTE_EXIT on the agent PID -> release on process death
+  * transcript      kqueue NOTE_WRITE on the session's transcript + periodic sweep; the tool's own
+                    log says exactly when a turn ended: interrupted (Esc), finished, or API error.
+                    Only records written AFTER the turn was registered are considered.
+State is persisted (tagged with boot time) so a daemon restart re-subscribes; on start and on
+shutdown sleep is re-enabled unless a live, active holder exists.
 """
-import json, os, select, signal, socket, subprocess, sys, time
+import glob, json, os, select, signal, socket, subprocess, sys, time
 
 BASE = os.environ.get("SLEEPLOCK_DIR", os.path.expanduser("~/.cache/sleeplock"))
 SOCK = os.path.join(BASE, "sock")
 STATE = os.path.join(BASE, "state.json")
 PMSET = os.environ.get("SLEEPLOCK_PMSET", "sudo -n /usr/bin/pmset").split()
+SWEEP_S = float(os.environ.get("SLEEPLOCK_SWEEP_S", "10"))
+TAIL_BYTES = 512 * 1024
+INTERRUPT_MARK = "[Request interrupted by user"
 
 
 def log(msg):
@@ -39,18 +49,109 @@ def pid_alive(pid):
         return True
 
 
+# ---------------------------------------------------------------- transcript classification
+def tool_for_path(path):
+    return "codex" if "/.codex/" in path or "/rollout-" in path else "claude"
+
+
+def read_records(path, offset=0):
+    """JSON records appended after byte `offset` (tail-limited). Returns (records, size)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            start = max(offset, size - TAIL_BYTES)
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return [], 0
+    lines = data.split(b"\n")
+    if start > offset and lines:
+        lines = lines[1:]                     # dropped a partial first line
+    out = []
+    for l in lines:
+        if not l.strip():
+            continue
+        try:
+            out.append(json.loads(l))
+        except ValueError:
+            pass
+    return out, size
+
+
+def classify(path, offset=0, tool=None):
+    """-> {"state": "active"|"idle"|"unknown", "reason": str, "detail": str}"""
+    recs, _ = read_records(path, offset)
+    if tool not in ("claude", "codex"):
+        tool = tool_for_path(path)
+        if tool == "claude" and any(r.get("type") in ("event_msg", "session_meta", "response_item") for r in recs):
+            tool = "codex"
+    if tool == "codex":
+        last = None
+        for r in recs:
+            if r.get("type") != "event_msg":
+                continue
+            t = (r.get("payload") or {}).get("type")
+            if t in ("task_started", "task_complete", "turn_aborted", "user_message"):
+                last = r
+        if last is None:
+            return {"state": "unknown", "reason": "no turn records yet", "detail": ""}
+        p = last["payload"]; t = p["type"]
+        if t in ("task_started", "user_message"):
+            return {"state": "active", "reason": "turn running", "detail": t}
+        if t == "turn_aborted":
+            return {"state": "idle", "reason": "interrupted", "detail": str(p.get("reason", ""))}
+        err = p.get("error")
+        if err:
+            return {"state": "idle", "reason": "error", "detail": str(err.get("message", err) if isinstance(err, dict) else err)[:120]}
+        return {"state": "idle", "reason": "finished", "detail": ""}
+    # claude
+    last = None
+    for r in recs:
+        if r.get("type") in ("user", "assistant") and not r.get("isSidechain"):
+            last = r
+    if last is None:
+        return {"state": "unknown", "reason": "no turn records yet", "detail": ""}
+    m = last.get("message") or {}
+    c = m.get("content")
+    if last["type"] == "assistant":
+        if last.get("isApiErrorMessage"):
+            text = " ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else str(c)
+            return {"state": "idle", "reason": "error", "detail": text[:120]}
+        stop = m.get("stop_reason")
+        if stop == "tool_use":
+            names = [b.get("name") for b in c if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(c, list) else []
+            return {"state": "active", "reason": "tool call in progress", "detail": ",".join(n for n in names if n)}
+        if stop in ("end_turn", "stop_sequence", "refusal"):
+            return {"state": "idle", "reason": "finished", "detail": stop}
+        return {"state": "active", "reason": "streaming", "detail": ""}
+    texts = [c] if isinstance(c, str) else [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    if any(t.startswith(INTERRUPT_MARK) for t in texts):
+        return {"state": "idle", "reason": "interrupted", "detail": texts[0][:60]}
+    kinds = "prompt" if isinstance(c, str) else ",".join(sorted({b.get("type", "?") for b in c if isinstance(b, dict)}))
+    return {"state": "active", "reason": "model thinking", "detail": kinds}
+
+
+def find_transcript(session):
+    pats = [os.path.expanduser(f"~/.claude/projects/*/{session}.jsonl"),
+            os.path.expanduser(f"~/.codex/sessions/*/*/*/rollout-*{session}*.jsonl")]
+    hits = [p for pat in pats for p in glob.glob(pat)]
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+# ---------------------------------------------------------------- daemon
 class Daemon:
     def __init__(self):
         os.makedirs(BASE, exist_ok=True)
-        self.holders = {}        # session -> {"pid","since","tool","cwd"}
+        self.holders = {}          # session -> {pid, since, tool, cwd, transcript, offset, waiting, state, reason, detail}
         self.kq = select.kqueue()
-        self.subscribed = set()
+        self.pid_subs = set()
+        self.file_fds = {}         # session -> fd (kqueue vnode watch)
         self.sleep_disabled = None
         self.boot = boot_time()
         self.load()
         self.apply(force=True)
 
-    # ---- persistence -------------------------------------------------------
+    # ---- persistence
     def load(self):
         try:
             with open(STATE) as f:
@@ -60,8 +161,9 @@ class Daemon:
         if saved.get("boot") != self.boot:
             log("state is from a previous boot -> discarded"); return
         for sess, h in saved.get("holders", {}).items():
-            if pid_alive(h["pid"]) and self.subscribe(h["pid"]):
+            if pid_alive(h["pid"]) and self.sub_pid(h["pid"]):
                 self.holders[sess] = h
+                self.watch_file(sess)
                 log(f"restored {sess} pid={h['pid']}")
 
     def save(self):
@@ -70,44 +172,100 @@ class Daemon:
             json.dump({"boot": self.boot, "holders": self.holders}, f)
         os.replace(tmp, STATE)
 
-    # ---- kqueue process subscription -------------------------------------
-    def subscribe(self, pid):
-        if pid in self.subscribed:
+    # ---- kqueue: processes
+    def sub_pid(self, pid):
+        if pid in self.pid_subs:
             return True
-        ev = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)
         try:
-            self.kq.control([ev], 0, 0)
-        except (ProcessLookupError, OSError):
+            self.kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        except OSError:
             return False
-        self.subscribed.add(pid)
-        return True
+        self.pid_subs.add(pid); return True
 
-    def unsubscribe(self, pid):
-        if pid not in self.subscribed or any(h["pid"] == pid for h in self.holders.values()):
+    def unsub_pid(self, pid):
+        if pid not in self.pid_subs or any(h["pid"] == pid for h in self.holders.values()):
             return
         try:
             self.kq.control([select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_DELETE)], 0, 0)
         except OSError:
             pass
-        self.subscribed.discard(pid)
+        self.pid_subs.discard(pid)
+
+    # ---- kqueue: transcript files
+    def watch_file(self, sess):
+        h = self.holders.get(sess)
+        if not h or not h.get("transcript") or sess in self.file_fds:
+            return
+        try:
+            fd = os.open(h["transcript"], os.O_RDONLY)
+            self.kq.control([select.kevent(fd, filter=select.KQ_FILTER_VNODE, flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                           fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME)], 0, 0)
+            self.file_fds[sess] = fd
+        except OSError:
+            pass                                   # not there yet; the sweep retries
+
+    def unwatch_file(self, sess):
+        fd = self.file_fds.pop(sess, None)
+        if fd is not None:
+            try:
+                self.kq.control([select.kevent(fd, filter=select.KQ_FILTER_VNODE, flags=select.KQ_EV_DELETE)], 0, 0)
+            except OSError:
+                pass
+            os.close(fd)
+
+    # ---- state transitions
+    def drop(self, sess, why):
+        h = self.holders.pop(sess, None)
+        if not h:
+            return
+        self.unwatch_file(sess); self.unsub_pid(h["pid"])
+        log(f"release {sess} ({why})")
 
     def on_exit(self, pid):
         for s in [s for s, h in self.holders.items() if h["pid"] == pid]:
-            del self.holders[s]
-            log(f"agent pid={pid} exited -> released {s}")
-        self.subscribed.discard(pid)
+            self.drop(s, f"agent pid={pid} exited")
+        self.pid_subs.discard(pid)
         self.changed()
 
-    # ---- pmset -----------------------------------------------------------
+    def check_transcript(self, sess):
+        """Re-classify one holder from its transcript; auto-release if the tool says the turn ended."""
+        h = self.holders.get(sess)
+        if not h or not h.get("transcript"):
+            return
+        if sess not in self.file_fds:
+            self.watch_file(sess)
+        c = classify(h["transcript"], h.get("offset", 0), h["tool"])
+        h.update(state=c["state"], reason=c["reason"], detail=c["detail"])
+        if c["state"] == "idle":
+            self.drop(sess, f"transcript: {c['reason']} {c['detail']}".rstrip())
+            return True
+        return False
+
+    def sweep(self):
+        changed = False
+        for sess in list(self.holders):
+            h = self.holders[sess]
+            if not pid_alive(h["pid"]):
+                self.drop(sess, "agent dead (sweep)"); changed = True; continue
+            if self.check_transcript(sess):
+                changed = True
+        if changed:
+            self.changed()
+        else:
+            self.save()
+
+    # ---- pmset
+    def active_holders(self):
+        return {s: h for s, h in self.holders.items() if not h.get("waiting")}
+
     def apply(self, force=False):
-        want = 1 if self.holders else 0
+        want = 1 if self.active_holders() else 0
         if want == self.sleep_disabled and not force:
             return
         try:
-            subprocess.run(PMSET + ["-a", "disablesleep", str(want)], check=True, timeout=15,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            subprocess.run(PMSET + ["-a", "disablesleep", str(want)], check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             self.sleep_disabled = want
-            log(f"pmset disablesleep {want} ({len(self.holders)} holder(s))")
+            log(f"pmset disablesleep {want} ({len(self.active_holders())} active / {len(self.holders)} holder(s))")
         except Exception as e:
             err = (getattr(e, "stderr", b"") or b"").decode(errors="replace").strip()
             log(f"pmset failed: {e} {err}")
@@ -115,38 +273,59 @@ class Daemon:
     def changed(self):
         self.save(); self.apply()
 
-    # ---- requests --------------------------------------------------------
+    # ---- requests
+    def register(self, req, waiting):
+        sess, pid = str(req["session"]), int(req["pid"])
+        if not self.sub_pid(pid):
+            return {"ok": False, "error": "agent pid not alive"}
+        old = self.holders.get(sess)
+        same = bool(old and old["pid"] == pid)
+        transcript = req.get("transcript") or (old or {}).get("transcript") or ""
+        h = {"pid": pid, "since": old["since"] if same else time.time(),
+             "tool": str(req.get("tool") or (old["tool"] if same else tool_for_path(transcript))),
+             "cwd": str(req.get("cwd") or (old["cwd"] if same else "")),
+             "transcript": transcript,
+             # offset: only records written after the turn was registered count. Kept across heartbeats.
+             "offset": old["offset"] if same and old.get("transcript") == transcript else (os.path.getsize(transcript) if transcript and os.path.exists(transcript) else 0),
+             "waiting": waiting, "state": "active", "reason": "registered", "detail": req.get("event", "")}
+        if old and not same:
+            self.unwatch_file(sess); self.unsub_pid(old["pid"])
+        self.holders[sess] = h
+        if old and old.get("transcript") != transcript:
+            self.unwatch_file(sess)
+        self.watch_file(sess)
+        log(f"{'waiting' if waiting else 'acquire'} {sess} pid={pid} tool={h['tool']} ev={req.get('event','')}")
+        self.changed(); return {"ok": True}
+
     def handle(self, req):
         cmd = req.get("cmd")
         if cmd == "acquire":
-            sess, pid = str(req["session"]), int(req["pid"])
-            if not self.subscribe(pid):
-                return {"ok": False, "error": "agent pid not alive"}
-            old = self.holders.get(sess)
-            same = old and old["pid"] == pid
-            self.holders[sess] = {"pid": pid, "since": old["since"] if same else time.time(),
-                                  "tool": str(req.get("tool") or (old["tool"] if same else "?")),
-                                  "cwd": str(req.get("cwd") or (old["cwd"] if same else ""))}
-            if old and old["pid"] != pid:
-                self.unsubscribe(old["pid"])
-            log(f"acquire {sess} pid={pid} tool={self.holders[sess]['tool']}")
-            self.changed(); return {"ok": True}
+            return self.register(req, waiting=False)
+        if cmd == "waiting":
+            return self.register(req, waiting=True)
         if cmd == "release":
-            h = self.holders.pop(str(req["session"]), None)
-            if h:
-                self.unsubscribe(h["pid"]); log(f"release {req['session']}"); self.changed()
-            return {"ok": True}
+            self.drop(str(req["session"]), f"hook {req.get('event', 'release')}"); self.changed(); return {"ok": True}
         if cmd == "release-all":
-            old = list(self.holders.values()); self.holders.clear()
-            for h in old:
-                self.unsubscribe(h["pid"])
-            log("release-all"); self.changed(); return {"ok": True}
+            for s in list(self.holders):
+                self.drop(s, "release-all")
+            self.changed(); return {"ok": True}
         if cmd == "status":
             return {"ok": True, "sleep_disabled": self.sleep_disabled, "now": time.time(),
                     "holders": {s: dict(h, alive=pid_alive(h["pid"])) for s, h in self.holders.items()}}
+        if cmd == "inspect":
+            sess = str(req["session"]); h = self.holders.get(sess)
+            path = (h or {}).get("transcript") or find_transcript(sess)
+            if not path:
+                return {"ok": False, "error": "no transcript found for that session"}
+            c = classify(path, 0, (h or {}).get("tool") or tool_for_path(path))
+            out = {"ok": True, "session": sess, "transcript": path, "registered": bool(h), "classification": c}
+            if h:
+                out["holder"] = dict(h, alive=pid_alive(h["pid"]))
+                out["turn_classification"] = classify(path, h.get("offset", 0), h["tool"])
+            return out
         return {"ok": False, "error": "unknown command"}
 
-    # ---- event loop ------------------------------------------------------
+    # ---- event loop
     def serve(self):
         if os.path.exists(SOCK):
             os.unlink(SOCK)
@@ -157,18 +336,29 @@ class Daemon:
         def on_signal(*_): stop["flag"] = True
         signal.signal(signal.SIGTERM, on_signal); signal.signal(signal.SIGINT, on_signal)
         log(f"listening on {SOCK}")
+        last_sweep = time.monotonic()
         while not stop["flag"]:
             try:
                 events = self.kq.control(None, 64, 1.0)
             except InterruptedError:
                 continue
+            touched = set()
             for ev in events:
                 if ev.filter == select.KQ_FILTER_PROC and ev.fflags & select.KQ_NOTE_EXIT:
                     self.on_exit(ev.ident)
                 elif ev.filter == select.KQ_FILTER_READ and ev.ident == srv.fileno():
                     self.accept(srv)
-        # defer: never leave the machine unable to sleep. State stays on disk so a restarted
-        # daemon can re-subscribe to agents that are still alive.
+                elif ev.filter == select.KQ_FILTER_VNODE:
+                    for s, fd in list(self.file_fds.items()):
+                        if fd == ev.ident:
+                            if ev.fflags & (select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME):
+                                self.unwatch_file(s)          # re-opened by the sweep if it comes back
+                            touched.add(s)
+            if touched:
+                if any(self.check_transcript(s) for s in touched if s in self.holders):
+                    self.changed()
+            if time.monotonic() - last_sweep >= SWEEP_S:
+                self.sweep(); last_sweep = time.monotonic()
         self.save()
         self.holders, saved = {}, self.holders
         self.apply(force=True)
@@ -199,4 +389,7 @@ class Daemon:
 
 
 if __name__ == "__main__":
-    Daemon().serve()
+    if len(sys.argv) > 2 and sys.argv[1] == "classify":      # offline: sleeplockd classify <transcript> [offset]
+        print(json.dumps(classify(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 0, sys.argv[4] if len(sys.argv) > 4 else None)))
+    else:
+        Daemon().serve()

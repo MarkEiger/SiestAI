@@ -57,25 +57,29 @@ except (OSError, ValueError):
 home = os.path.expanduser("~")
 now = st.get("now", time.time())
 holders = sorted(st["holders"].items(), key=lambda kv: kv[1]["since"])
-rows = [(h["tool"], (h["cwd"] or "?").replace(home, "~"), dur(now - h["since"]), h["pid"], sid, h.get("alive", True))
+rows = [(h["tool"], (h["cwd"] or "?").replace(home, "~"), dur(now - h["since"]), h["pid"], sid, h.get("alive", True),
+         "waiting" if h.get("waiting") else h.get("state", "active"), h.get("reason", ""))
         for sid, h in holders]
-n = len(rows)
+n_active = sum(1 for r in rows if r[6] != "waiting"); n_wait = len(rows) - n_active
 blocked = st.get("sleep_disabled") == 1
 
 if blocked:
-    detail = "; ".join(f"{t} {c} ({d})" for t, c, d, *_ in rows)
-    tip = f"Sleep blocked by {n} running prompt{'s' if n != 1 else ''}: {detail}"
-    print(f"{ICON_HELD} {n} {ZZZ} | tooltip={esc(tip)}")
+    detail = "; ".join(f"{t} {c} ({d})" for t, c, d, _, _, _, stt, _ in rows if stt != "waiting")
+    tip = f"Sleep blocked by {n_active} running prompt{'s' if n_active != 1 else ''}: {detail}"
+    if n_wait: tip += f" — {n_wait} more waiting on you"
+    print(f"{ICON_HELD} {n_active} {ZZZ} | tooltip={esc(tip)}")
 else:
-    print(f"{ICON_FREE} {n} {ZZZ} | tooltip=Sleep allowed — no prompts running")
+    tip = "Sleep allowed — no prompts running" + (f" ({n_wait} waiting on you)" if n_wait else "")
+    print(f"{ICON_FREE} {n_active} {ZZZ} | tooltip={esc(tip)}")
 
 print("---")
-print(("Sleep blocked — " if blocked else "Sleep allowed — ") + f"{n} running prompt{'s' if n != 1 else ''} | size=12")
+print(("Sleep blocked — " if blocked else "Sleep allowed — ") + f"{n_active} running prompt{'s' if n_active != 1 else ''}" + (f", {n_wait} waiting on you" if n_wait else "") + " | size=12")
 if rows:
     print("---")
-    for tool, cwd, d, pid, sid, alive in rows:
-        label = f"{tool:<6} {cwd}  ·  {d}  ·  pid {pid}" + ("" if alive else "  (dead)")
-        print(f"{esc(label)} | font=Menlo size=12 tooltip=session {esc(sid)} — click to release this one "
+    for tool, cwd, d, pid, sid, alive, stt, reason in rows:
+        mark = "⏸" if stt == "waiting" else "▶"
+        label = f"{mark} {tool:<6} {cwd}  ·  {d}  ·  pid {pid}" + ("" if alive else "  (dead)")
+        print(f"{esc(label)} | font=Menlo size=12 tooltip={esc(('waiting on you' if stt == 'waiting' else reason) + ' — session ' + sid + ' — click to release')} "
               f"bash={sys.executable} param1={ME} param2=release param3={esc(sid)} terminal=false refresh=true")
 print("---")
 print(f"Release all (allow sleep now) | bash={sys.executable} param1={ME} param2=release-all terminal=false refresh=true")

@@ -2,7 +2,7 @@
   "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
   "PreToolUse":        [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
   "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock acquire" }] }],
-  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
+  "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock waiting" }] }],
   "Stop":              [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }],
   "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "~/.local/bin/sleeplock release" }] }]
 }
