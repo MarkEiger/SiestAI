@@ -1,7 +1,7 @@
 # SiestAI
 
-
 Let the machine take its siesta — but only when the AI is done. macOS today; Linux port is straightforward (see the bottom of this file).
+
 Keeps a Mac awake (lid closed included) **only while a Claude Code / Codex prompt is running**, across any number of concurrent sessions.
 
 ```
