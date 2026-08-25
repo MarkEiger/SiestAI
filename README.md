@@ -11,14 +11,14 @@ menu-bar app / CLI      ─┘                       └─ state.json (survives
 - **Per prompt, not per session:** `UserPromptSubmit` registers the turn, `Stop` (or `SessionEnd` / `idle_prompt`) releases it.
 - **Bound to the process:** if the agent dies without firing `Stop`, the kernel tells the daemon and the turn is released.
 - **Boot safety:** a root LaunchDaemon runs `pmset disablesleep 0` on every boot; the user daemon also resets on start and discards state from a previous boot.
-- **Query:** `sleeplock status` (`--json`), `sleeplock gui` (dialog), or the **SleepLockMenu** menu-bar app (☕ = awake, ☾ = sleep allowed; lists tool / dir / duration per turn; click a row to release it).
+- **Query:** menu-bar item `☕ 2 💤` (sleep blocked by 2 prompts) / `☾ 0 💤` (sleep allowed) / `⚠︎ 💤` (daemon down). Hover for who/where/how long; click for the list, release one row, or release all. Delivered as a **SwiftBar plugin** (`swiftbar/sleeplock.2s.py`, sits next to your other SwiftBar items) when SwiftBar is installed, otherwise as the native **SleepLockMenu** app. CLI: `sleeplock status [--json]`, `sleeplock gui`.
 
 ## Install / uninstall
 ```sh
-./install.sh            # --no-codex  --no-gui  --dry-run
+./install.sh            # --no-codex  --no-gui  --native-gui  --dry-run
 ./uninstall.sh
 ```
-Install writes: `~/.local/bin/{sleeplock,sleeplockd,SleepLockMenu}`, `/etc/sudoers.d/sleeplock`, `/Library/LaunchDaemons/local.sleeplock.boot.plist`, `~/Library/LaunchAgents/local.sleeplock{d,.menu}.plist`, hook entries in `~/.claude/settings.json` and `~/.codex/hooks.json` (+ `features.hooks = true` in `~/.codex/config.toml`). Existing settings are backed up as `*.bak-<timestamp>`.
+Install writes: `~/.local/bin/{sleeplock,sleeplockd}`, the SwiftBar plugin (or `~/.local/bin/SleepLockMenu`), `/etc/sudoers.d/sleeplock`, `/Library/LaunchDaemons/local.sleeplock.boot.plist`, `~/Library/LaunchAgents/local.sleeplock{d,.menu}.plist`, hook entries in `~/.claude/settings.json` and `~/.codex/hooks.json` (+ `features.hooks = true` in `~/.codex/config.toml`). Existing settings are backed up as `*.bak-<timestamp>`.
 
 ## Files
 | path | role |
@@ -26,7 +26,8 @@ Install writes: `~/.local/bin/{sleeplock,sleeplockd,SleepLockMenu}`, `/etc/sudoe
 | `bin/sleeplockd` | daemon: socket + kqueue event loop |
 | `bin/sleeplock` | hook client / CLI |
 | `bin/merge-hooks.py` | adds/removes our hook entries in a settings file |
-| `gui/SleepLockMenu.swift` | menu-bar app |
+| `swiftbar/sleeplock.2s.py` | SwiftBar plugin (preferred GUI) |
+| `gui/SleepLockMenu.swift` | native menu-bar app (fallback GUI) |
 | `launchd/*.plist` | templates (`__HOME__`, `__PY__` filled by install) |
 | `hooks/*.json` | hook definitions per tool |
 

@@ -7,6 +7,7 @@ PREFIX="$HOME/.local/bin"; AGENTS="$HOME/Library/LaunchAgents"; UID_=$(id -u); P
 for label in local.sleeplock.menu local.sleeplockd; do launchctl bootout "gui/$UID_/$label" 2>/dev/null; rm -f "$AGENTS/$label.plist"; done
 "$PY" bin/merge-hooks.py remove "$HOME/.claude/settings.json" hooks/claude.json
 [ -f "$HOME/.codex/hooks.json" ] && "$PY" bin/merge-hooks.py remove "$HOME/.codex/hooks.json" hooks/codex.json
+SWIFTBAR_DIR=$(defaults read com.ameba.SwiftBar PluginDirectory 2>/dev/null || true); [ -n "$SWIFTBAR_DIR" ] && rm -f "$SWIFTBAR_DIR/sleeplock.2s.py"
 rm -f "$PREFIX/sleeplock" "$PREFIX/sleeplockd" "$PREFIX/SleepLockMenu" "$HOME/.cache/sleeplock/sock" "$HOME/.cache/sleeplock/state.json"
 echo "root parts (asks for password):"
 sudo launchctl bootout system/local.sleeplock.boot 2>/dev/null
