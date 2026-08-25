@@ -66,16 +66,17 @@ def read_records(path, offset=0, window=TAIL_BYTES):
     except OSError:
         return [], 0, 0
     lines = data.split(b"\n")
+    pos = start
     if start > offset and lines:
-        lines = lines[1:]                     # dropped a partial first line
+        pos += len(lines[0]) + 1; lines = lines[1:]     # dropped a partial first line
     out = []
     for l in lines:
-        if not l.strip():
-            continue
-        try:
-            out.append(json.loads(l))
-        except ValueError:
-            pass
+        if l.strip():
+            try:
+                r = json.loads(l); r["_pos"] = pos; out.append(r)
+            except ValueError:
+                pass
+        pos += len(l) + 1
     return out, start, size
 
 
@@ -110,41 +111,41 @@ def classify(path, offset=0, tool=None):
             if t in CODEX_MARKS:
                 last = r
         if last is None:
-            return {"state": "unknown", "reason": "no turn records yet", "detail": ""}
-        p = last["payload"]; t = p["type"]
+            return {"state": "unknown", "reason": "no turn records yet", "detail": "", "pos": None}
+        p = last["payload"]; t = p["type"]; pos = last.get("_pos")
         if t in ("task_started", "user_message"):
-            return {"state": "active", "reason": "turn running", "detail": t}
+            return {"state": "active", "reason": "turn running", "detail": t, "pos": pos, "pos": last.get("_pos")}
         if t == "turn_aborted":
-            return {"state": "idle", "reason": "interrupted", "detail": str(p.get("reason", ""))}
+            return {"state": "idle", "reason": "interrupted", "detail": str(p.get("reason", "")), "pos": pos, "pos": last.get("_pos")}
         err = p.get("error")
         if err:
-            return {"state": "idle", "reason": "error", "detail": str(err.get("message", err) if isinstance(err, dict) else err)[:120]}
-        return {"state": "idle", "reason": "finished", "detail": ""}
+            return {"state": "idle", "reason": "error", "detail": str(err.get("message", err) if isinstance(err, dict) else err)[:120], "pos": pos, "pos": last.get("_pos")}
+        return {"state": "idle", "reason": "finished", "detail": "", "pos": pos, "pos": last.get("_pos")}
     # claude
     last = None
     for r in recs:
         if r.get("type") in ("user", "assistant") and not r.get("isSidechain"):
             last = r
     if last is None:
-        return {"state": "unknown", "reason": "no turn records yet", "detail": ""}
+        return {"state": "unknown", "reason": "no turn records yet", "detail": "", "pos": None}
     m = last.get("message") or {}
     c = m.get("content")
     if last["type"] == "assistant":
         if last.get("isApiErrorMessage"):
             text = " ".join(b.get("text", "") for b in c if isinstance(b, dict)) if isinstance(c, list) else str(c)
-            return {"state": "idle", "reason": "error", "detail": text[:120]}
+            return {"state": "idle", "reason": "error", "detail": text[:120], "pos": last.get("_pos")}
         stop = m.get("stop_reason")
         if stop == "tool_use":
             names = [b.get("name") for b in c if isinstance(b, dict) and b.get("type") == "tool_use"] if isinstance(c, list) else []
-            return {"state": "active", "reason": "tool call in progress", "detail": ",".join(n for n in names if n)}
+            return {"state": "active", "reason": "tool call in progress", "detail": ",".join(n for n in names if n), "pos": last.get("_pos")}
         if stop in ("end_turn", "stop_sequence", "refusal"):
-            return {"state": "idle", "reason": "finished", "detail": stop}
-        return {"state": "active", "reason": "streaming", "detail": ""}
+            return {"state": "idle", "reason": "finished", "detail": stop, "pos": last.get("_pos")}
+        return {"state": "active", "reason": "streaming", "detail": "", "pos": last.get("_pos")}
     texts = [c] if isinstance(c, str) else [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
     if any(t.startswith(INTERRUPT_MARK) for t in texts):
-        return {"state": "idle", "reason": "interrupted", "detail": texts[0][:60]}
+        return {"state": "idle", "reason": "interrupted", "detail": texts[0][:60], "pos": last.get("_pos")}
     kinds = "prompt" if isinstance(c, str) else ",".join(sorted({b.get("type", "?") for b in c if isinstance(b, dict)}))
-    return {"state": "active", "reason": "model thinking", "detail": kinds}
+    return {"state": "active", "reason": "model thinking", "detail": kinds, "pos": last.get("_pos")}
 
 
 def find_transcript(session):
@@ -308,7 +309,7 @@ class Daemon:
              "cwd": str(req.get("cwd") or (old["cwd"] if same else "")),
              "transcript": transcript,
              # offset: only records written after the turn was registered count. Kept across heartbeats.
-             "offset": old["offset"] if same and old.get("transcript") == transcript else (os.path.getsize(transcript) if transcript and os.path.exists(transcript) else 0),
+             "offset": old["offset"] if same and old.get("transcript") == transcript else self.initial_offset(transcript, req.get("tool")),
              "waiting": waiting, "state": "active", "reason": "registered", "detail": req.get("event", "")}
         if old and not same:
             self.unwatch_file(sess); self.unsub_pid(old["pid"])
@@ -318,6 +319,18 @@ class Daemon:
         self.watch_file(sess)
         log(f"{'waiting' if waiting else 'acquire'} {sess} pid={pid} tool={h['tool']} ev={req.get('event','')}")
         self.changed(); return {"ok": True}
+
+    @staticmethod
+    def initial_offset(transcript, tool):
+        """Records before registration don't count — except when the tool already logged the start of
+        the turn being registered (Codex writes task_started before firing UserPromptSubmit)."""
+        if not transcript or not os.path.exists(transcript):
+            return 0
+        size = os.path.getsize(transcript)
+        c = classify(transcript, 0, tool if tool in ("claude", "codex") else None)
+        if c["state"] == "active" and c.get("pos") is not None:
+            return c["pos"]
+        return size
 
     def handle(self, req):
         cmd = req.get("cmd")

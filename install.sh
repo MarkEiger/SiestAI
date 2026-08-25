@@ -60,8 +60,11 @@ run install -d "$AGENTS"
 for label in local.sleeplockd $([ $MENU = native ] && echo local.sleeplock.menu); do
   if [ $DRY = 1 ]; then echo "+ render $label.plist"; else render "$label.plist"; fi
   run launchctl bootout "gui/$UID_/$label" 2>/dev/null || true
-  sleep 0.5
-  run launchctl bootstrap "gui/$UID_" "$AGENTS/$label.plist"
+  for attempt in 1 2 3 4 5 6; do          # launchd needs a moment after bootout; retry "Bootstrap failed: 5"
+    sleep 1
+    if run launchctl bootstrap "gui/$UID_" "$AGENTS/$label.plist" 2>/dev/null; then break; fi
+    [ $attempt = 6 ] && { echo "could not bootstrap $label"; launchctl bootstrap "gui/$UID_" "$AGENTS/$label.plist"; exit 1; }
+  done
 done
 
 say "hooks: Claude Code"
