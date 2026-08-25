@@ -107,6 +107,19 @@ def focus_kitty(pids, tty, kitty_pid=None):
     return None
 
 
+def focus_wezterm(pids, tty):
+    try:
+        panes = json.loads(sh("wezterm", "cli", "list", "--format", "json"))
+    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    for pane in panes:
+        if tty and pane.get("tty_name") == tty:
+            subprocess.run(["wezterm", "cli", "activate-pane", "--pane-id", str(pane["pane_id"])])
+            subprocess.run(["open", "-a", "WezTerm"])
+            return f"wezterm pane {pane['pane_id']}"
+    return None
+
+
 def focus_terminal_app(tty):
     script = f'''
     tell application "Terminal"
@@ -165,7 +178,8 @@ def focus(pid):
     if "kitty" in apps: order.append(lambda: focus_kitty(pids, tty, kitty_pid))
     if "terminal" in apps: order.append(lambda: focus_terminal_app(tty))
     if "iterm2" in apps: order.append(lambda: focus_iterm(tty))
-    order += [lambda: focus_kitty(pids, tty, kitty_pid), lambda: focus_terminal_app(tty), lambda: focus_iterm(tty)]
+    if "wezterm-gui" in apps or "wezterm" in apps: order.append(lambda: focus_wezterm(pids, tty))
+    order += [lambda: focus_kitty(pids, tty, kitty_pid), lambda: focus_terminal_app(tty), lambda: focus_iterm(tty), lambda: focus_wezterm(pids, tty)]
     for fn in order:
         try:
             r = fn()
@@ -173,10 +187,11 @@ def focus(pid):
             r = None
         if r:
             return r
-    for c in comms.values():                       # last resort: just raise the terminal app
-        if c.lower() in ("kitty", "terminal", "iterm2", "wezterm", "alacritty", "ghostty", "warp"):
-            subprocess.run(["open", "-a", {"terminal": "Terminal", "iterm2": "iTerm"}.get(c.lower(), c)])
-            return f"raised {c} (couldn't locate the exact tab; kitty needs allow_remote_control + listen_on)"
+    for p, c in comms.items():                     # last resort: raise the specific terminal process (its window)
+        if c.lower() in ("kitty", "terminal", "iterm2", "wezterm-gui", "wezterm", "alacritty", "ghostty", "warp"):
+            activate_pid(p, {"terminal": "Terminal", "iterm2": "iTerm", "wezterm-gui": "WezTerm"}.get(c.lower(), c))
+            hint = " (kitty: enable allow_remote_control + listen_on and restart kitty for exact-tab focus)" if c.lower() == "kitty" else " (no tab API for this terminal)"
+            return f"raised {c} pid {p}{hint}"
     return None
 
 
